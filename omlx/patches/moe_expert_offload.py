@@ -849,7 +849,11 @@ class OffloadSwitchGLU(nn.Module):
         try:
             if w_i is not None and w_j is not None:
                 if self._pf_ratio is None:
-                    self._pf_ratio = (w_j / w_i).astype(x.dtype)
+                    # A zero scale on this side would make the ratio inf;
+                    # leave that channel unscaled instead.
+                    ok = mx.abs(w_i) > 1e-6
+                    ratio = mx.where(ok, w_j / mx.where(ok, w_i, 1), 1)
+                    self._pf_ratio = ratio.astype(x.dtype)
                 logits = gate(x * self._pf_ratio)
             else:
                 logits = gate(x)
@@ -1280,13 +1284,41 @@ def _layer_module_for_path(model, path: str):
     return layers[idx]
 
 
+def _moe_input_scale(layer) -> tuple[mx.array, str] | None:
+    """The per-channel scale of the norm that feeds this layer's MoE input.
+
+    Classic layers norm the residual with ``post_attention_layernorm``; its
+    weight is the scale. Hyper-connection layers (qwen4_exp) have no such
+    norm: ``mlp_hyper_connection.hc_norm`` norms each of the ``hc_count``
+    residual streams, and the MoE input is a learned mix of the normed
+    streams. Its scale (``1 + weight`` for zero-centred Qwen4 norms, via
+    ``_scale``) is averaged over the streams to one ``hidden_size`` vector,
+    an approximation the agreement gate polices. Returns ``(scale, hook)``
+    or None.
+    """
+    ln = getattr(layer, "post_attention_layernorm", None)
+    w = getattr(ln, "weight", None) if ln is not None else None
+    if w is not None:
+        return w, "post_attention_layernorm"
+    hc = getattr(layer, "mlp_hyper_connection", None)
+    norm = getattr(hc, "hc_norm", None) if hc is not None else None
+    if norm is None or getattr(norm, "weight", None) is None:
+        return None
+    scale_fn = getattr(norm, "_scale", None)
+    scale = scale_fn() if callable(scale_fn) else norm.weight
+    group = getattr(norm, "group_size", None)
+    if group and scale.size > group and scale.size % group == 0:
+        scale = mx.mean(scale.astype(mx.float32).reshape(-1, group), axis=0)
+    return scale, "mlp_hyper_connection.hc_norm"
+
+
 def _link_cross_layer_prefetch(model) -> int:
     """Wire adjacent wrapped MoE layers for attention-window prefetch.
 
     Only runs when ``OMLX_MOE_OFFLOAD_PREFETCH=1``. Skips pairs that are not
     consecutive layer indices (an intervening block stales the residual) or
-    that lack a router / post-attention RMSNorm weights for the gate-ratio
-    trick. Returns the number of links created.
+    that lack a router / MoE-input norm scale for the gate-ratio trick (see
+    :func:`_moe_input_scale`). Returns the number of links created.
     """
     if not _prefetch_enabled():
         return 0
@@ -1315,28 +1347,31 @@ def _link_cross_layer_prefetch(model) -> int:
     walk(model, "")
     found.sort(key=lambda t: t[0])
     linked = 0
+    hooks = set()
     for (i, layer_i, switch_i, _), (j, layer_j, switch_j, _) in zip(
         found, found[1:]
     ):
         if j != i + 1:
             continue
         gate = _find_moe_gate(layer_j)
-        ln_i = getattr(layer_i, "post_attention_layernorm", None)
-        ln_j = getattr(layer_j, "post_attention_layernorm", None)
-        if gate is None or ln_i is None or ln_j is None:
+        s_i = _moe_input_scale(layer_i)
+        s_j = _moe_input_scale(layer_j)
+        # Both ends must use the same hook: a ratio across norm kinds is noise.
+        if gate is None or s_i is None or s_j is None or s_i[1] != s_j[1]:
             continue
-        w_i = getattr(ln_i, "weight", None)
-        w_j = getattr(ln_j, "weight", None)
-        if w_i is None or w_j is None:
+        if s_i[0].shape != s_j[0].shape:
             continue
-        switch_i._pf_next = (switch_j.cache, gate, w_i, w_j)
+        switch_i._pf_next = (switch_j.cache, gate, s_i[0], s_j[0])
         switch_i._pf_ratio = None
+        hooks.add(s_i[1])
         linked += 1
-    if linked:
-        logger.info(
-            "moe expert offload: cross-layer prefetch linked %d adjacent layer pairs",
-            linked,
-        )
+    logger.info(
+        "moe expert offload: cross-layer prefetch linked %d/%d adjacent layer "
+        "pairs (hook: %s)",
+        linked,
+        max(0, len(found) - 1),
+        ", ".join(sorted(hooks)) or "none",
+    )
     return linked
 
 

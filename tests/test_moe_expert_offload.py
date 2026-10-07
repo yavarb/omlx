@@ -1470,7 +1470,105 @@ def _routed_checkpoint(tmp_path, n_layers=2):
     return _RoutedMoE(glus), glus
 
 
+_HC = 4  # hyper-connection streams in the qwen4-style fixture
+
+
+class _HyperResidual(nn.Module):
+    """The attribute shape of Qwen4ExpGatedResidual the linker reads."""
+
+    def __init__(self, seed):
+        super().__init__()
+        from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
+
+        compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+        from mlx_vlm.models.qwen4_exp.language import Qwen4ExpRMSNorm
+
+        self.hc_norm = Qwen4ExpRMSNorm(_HC * D, group_size=D)
+        # Zero-centred like the checkpoint; scale is 1 + weight.
+        self.hc_norm.weight = 0.1 * mx.random.normal((_HC * D,), key=mx.random.key(seed))
+
+
+class _HyperLayer(nn.Module):
+    """qwen4_exp-style layer: no post_attention_layernorm, HC residuals."""
+
+    def __init__(self, glu, seed):
+        super().__init__()
+        self.attn_hyper_connection = _HyperResidual(seed + 100)
+        self.mlp_hyper_connection = _HyperResidual(seed)
+        self.mlp = _MoeBlock(glu)
+
+
+class _HyperMoE(nn.Module):
+    def __init__(self, glus):
+        super().__init__()
+        self.layers = [_HyperLayer(g, i) for i, g in enumerate(glus)]
+
+    def __call__(self, x, indices):
+        for layer in self.layers:
+            x = x + layer.mlp.switch_glu(x, indices).sum(axis=-2)
+        return x
+
+
+def _hyper_checkpoint(tmp_path, n_layers=2):
+    glus = [_make_glu(seed=i) for i in range(n_layers)]
+    tensors = {}
+    for i, g in enumerate(glus):
+        tensors.update(_glu_tensors(g, f"layers.{i}.mlp.switch_glu"))
+    _save_checkpoint(tmp_path, tensors)
+    return _HyperMoE(glus), glus
+
+
 class TestCrossLayerPrefetch:
+    def test_hyper_connection_layers_link(self, tmp_path, monkeypatch):
+        """qwen4_exp has no post_attention_layernorm; link via hc_norm."""
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_PREFETCH", "1")
+        model, _ = _hyper_checkpoint(tmp_path, n_layers=3)
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 3
+        a, b, c = [layer.mlp.switch_glu for layer in model.layers]
+        assert a._pf_next is not None and a._pf_next[0] is b.cache
+        assert b._pf_next is not None and b._pf_next[0] is c.cache
+        assert c._pf_next is None
+        # Scales are the stream-averaged 1 + weight, one per hidden channel.
+        _cache, gate, w_i, w_j = a._pf_next
+        assert gate is model.layers[1].mlp.gate
+        assert w_i.shape == (D,) and w_j.shape == (D,)
+        expect = mx.mean(
+            1.0 + model.layers[0].mlp_hyper_connection.hc_norm.weight.reshape(_HC, D),
+            axis=0,
+        )
+        assert bool(mx.allclose(w_i, expect))
+
+    def test_hyper_connection_prediction_runs(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_PREFETCH", "1")
+        model, _ = _hyper_checkpoint(tmp_path)
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        sw0 = model.layers[0].mlp.switch_glu
+        x = mx.random.normal((1, 1, D))
+        pred = sw0._pf_pred_lazy(x, K)
+        assert pred is not None
+        mx.eval(*pred)
+        assert pred[0].shape[-1] == K
+        assert bool(mx.all(mx.isfinite(sw0._pf_ratio)))
+
+    def test_hyper_connection_on_off_bit_identical(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_OVERLAP", "0")
+        x = mx.random.normal((1, 1, D))
+        idx = _ri(1, 1, K)
+        outs = []
+        for flag in ("0", "1"):
+            monkeypatch.setenv("OMLX_MOE_OFFLOAD_PREFETCH", flag)
+            model, _ = _hyper_checkpoint(tmp_path)
+            apply_moe_expert_offload(model, tmp_path, 0.25)
+            assert (model.layers[0].mlp.switch_glu._pf_next is not None) == (
+                flag == "1"
+            )
+            y = model(x, idx)
+            y2 = model(x, idx)  # second step absorbs the first's prefetch
+            mx.eval(y, y2)
+            outs.append((y, y2))
+        assert bool(mx.array_equal(outs[0][0], outs[1][0]))
+        assert bool(mx.array_equal(outs[0][1], outs[1][1]))
+
     def test_prefetch_default_off_does_not_link(self, tmp_path, monkeypatch):
         monkeypatch.delenv("OMLX_MOE_OFFLOAD_PREFETCH", raising=False)
         model, _ = _routed_checkpoint(tmp_path)
