@@ -35,13 +35,15 @@ with a resident-fraction field accepting 5% to 95%, including fractional percent
 Toggling triggers an engine reload (it is a load-time transform). The env
 kill switch `OMLX_MOE_EXPERT_OFFLOAD=0` disables it regardless of settings.
 
-Three env vars tune the read path, and none changes what is computed:
+Env vars tune the read path; none changes what is computed:
 
 | variable | default | effect |
 |---|---|---|
 | `OMLX_MOE_OFFLOAD_IO_WORKERS` | 12 | threads reading missing experts. `1` or less (or an unparseable value) keeps the serial path and starts no threads |
 | `OMLX_MOE_OFFLOAD_IO_BATCH` | `4 x workers` | experts whose reads may be in flight at once — the bound on the host memory the pipeline holds ahead of the slot writes |
 | `OMLX_MOE_OFFLOAD_OVERLAP` | 1 | in decode, when a step's reads are slow, keep the GPU busy while they finish: compute the resident routes, keep the GPU clocked for the rest of the read, and dispatch each layer's output as soon as it is built (needs the parallel reader). Steps whose reads arrive within 0.5 ms keep the serial order. `0` keeps the serial order for every step: read, then compute |
+| `OMLX_MOE_OFFLOAD_PREFETCH` | 0 | **opt-in** cross-layer L→L+1 expert prefetch (streamlx F18). When `1`, adjacent wrapped MoE layers predict L+1's routes from L's residual (gate-ratio / attention-window) and read missing experts while L computes. Default **off** because a naive L+1 predictor was measured 2–15% slower when mispredicts fought demand SSD reads. Requires the parallel reader. Composes with `OMLX_MOE_OFFLOAD_OVERLAP`; does not change numerics |
+| `OMLX_MOE_PF_TOPM` | 7 | when prefetch is on, only the top-`M` confidence-ranked predicted experts are read (mispredicts concentrate in the rank tail) |
 
 ## Performance
 
@@ -78,7 +80,7 @@ step mlx-lm runs ahead of that yield, rather than measuring pure prefill:
 
 Decode is untouched by the change (it takes the no-sync fast path).
 
-A miss evicts the resident expert with the lowest decayed routing count: each routed occurrence adds 1, and every count is multiplied by 0.7 every 4 calls. On replayed Qwen3.8-Flash-Next routing traces this misses 5-7% less often than LRU at 10-25% residency. Reading layer L+1's predicted experts ahead during layer L (its router applied to layer L's input) was measured as well and is not used: the prediction covered 59% of the misses at 10% residency, but the wrong predictions competed with the demand reads for the SSD and decode was 2-15% slower.
+A miss evicts the resident expert with the lowest decayed routing count: each routed occurrence adds 1, and every count is multiplied by 0.7 every 4 calls. On replayed Qwen3.8-Flash-Next routing traces this misses 5-7% less often than LRU at 10-25% residency. A naive L+1 predictor (next router applied to layer L's raw input) covered ~59% of misses at 10% residency but competed with demand SSD reads and was 2–15% slower — that path stays abandoned. An **opt-in** attention-window / gate-ratio predictor (streamlx F18; `OMLX_MOE_OFFLOAD_PREFETCH=1`) is available instead: it reproduces L+1's post-attn RMSNorm input via `w_{L+1}/w_L`, caps launches with `OMLX_MOE_PF_TOPM`, disables a link when agreement falls below ~0.55 after 512 samples, absorbs before demand `ensure`, and launches only after the current layer's demand path so prefetch cannot starve within-layer overlap (#4037). Default remains off.
 
 A call's misses are read in parallel with `os.pread` on a shared thread pool. `ensure()` protects every expert the call routes to, so a miss never evicts one of them, then schedules the missing experts before the serial install loop. Slot writes, eviction state, and hit/miss counters stay on the calling thread. In an over-capacity prefill, the reads of the next expert-major chunk's first misses start before the current chunk is evaluated; their slot writes still wait for it.
 

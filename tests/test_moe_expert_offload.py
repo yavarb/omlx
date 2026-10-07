@@ -1426,3 +1426,174 @@ def test_packed_prefill_chunks_match_whole_expert_chunks(tmp_path, monkeypatch):
         outputs.append(out)
     assert packed == [[(0, 128), (128, 256), (256, 320)]]
     assert bool(mx.array_equal(*outputs))
+
+# ---------------------------------------------------------------------------
+# Cross-layer L→L+1 expert prefetch (opt-in, default off)
+# ---------------------------------------------------------------------------
+
+
+class _MoeBlock(nn.Module):
+    def __init__(self, glu, d=D, e=E):
+        super().__init__()
+        self.gate = nn.Linear(d, e, bias=False)
+        self.switch_glu = glu
+
+
+class _RoutedLayer(nn.Module):
+    def __init__(self, glu):
+        super().__init__()
+        self.post_attention_layernorm = nn.RMSNorm(D)
+        self.mlp = _MoeBlock(glu)
+
+
+class _RoutedMoE(nn.Module):
+    """Mini model with gate + RMSNorm so apply can link adjacent layers."""
+
+    def __init__(self, glus):
+        super().__init__()
+        self.layers = [_RoutedLayer(g) for g in glus]
+
+    def __call__(self, x, indices):
+        for layer in self.layers:
+            h = layer.post_attention_layernorm(x)
+            # indices supplied by the test (router not driven here)
+            x = x + layer.mlp.switch_glu(h, indices).sum(axis=-2)
+        return x
+
+
+def _routed_checkpoint(tmp_path, n_layers=2):
+    glus = [_make_glu(seed=i) for i in range(n_layers)]
+    tensors = {}
+    for i, g in enumerate(glus):
+        tensors.update(_glu_tensors(g, f"layers.{i}.mlp.switch_glu"))
+    _save_checkpoint(tmp_path, tensors)
+    return _RoutedMoE(glus), glus
+
+
+class TestCrossLayerPrefetch:
+    def test_prefetch_default_off_does_not_link(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("OMLX_MOE_OFFLOAD_PREFETCH", raising=False)
+        model, _ = _routed_checkpoint(tmp_path)
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 2
+        for layer in model.layers:
+            sw = layer.mlp.switch_glu
+            assert isinstance(sw, OffloadSwitchGLU)
+            assert sw._pf_next is None
+
+    def test_prefetch_links_adjacent_when_enabled(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_PREFETCH", "1")
+        model, _ = _routed_checkpoint(tmp_path, n_layers=3)
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 3
+        a, b, c = [layer.mlp.switch_glu for layer in model.layers]
+        assert a._pf_next is not None
+        assert a._pf_next[0] is b.cache
+        assert b._pf_next is not None
+        assert b._pf_next[0] is c.cache
+        assert c._pf_next is None  # last layer has no L+1
+
+    def test_topm_caps_prefetch_launch(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_PREFETCH", "1")
+        monkeypatch.setenv("OMLX_MOE_PF_TOPM", "2")
+        model, _ = _routed_checkpoint(tmp_path)
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        nxt = model.layers[1].mlp.switch_glu.cache
+        # Predict 6 experts; only top-2 missing should launch.
+        pred = list(range(6))
+        nxt.prefetch_start(pred)
+        assert nxt._pf is not None
+        _pred_set, launch, fut, rank_of = nxt._pf
+        assert len(launch) <= 2
+        assert all(rank_of[e] < 2 for e in launch)
+        if fut is not None:
+            fut.result()  # drain
+
+    def test_agreement_gate_disables_prediction(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_PREFETCH", "1")
+        model, _ = _routed_checkpoint(tmp_path)
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        sw0 = model.layers[0].mlp.switch_glu
+        nxt = sw0._pf_next[0]
+        # Simulate chronic mispredicts past warmup.
+        nxt.pf_agree_hit = 100
+        nxt.pf_agree_tot = 512
+        assert nxt.prefetch_agreement() < 0.55
+        x = mx.random.normal((1, 1, D))
+        assert sw0._pf_pred_lazy(x, K) is None
+
+    def test_absorb_before_ensure_installs_hits(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_PREFETCH", "1")
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_OVERLAP", "0")
+        model, _ = _routed_checkpoint(tmp_path)
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        sw1 = model.layers[1].mlp.switch_glu
+        cache = sw1.cache
+        # Prefetch experts 0 and 1 into layer 1's cache.
+        cache.prefetch_start([0, 1, 2, 3])
+        assert cache._pf is not None
+        # Absorb only what the step wants.
+        before = cache.misses
+        cache.prefetch_absorb([0, 1])
+        assert 0 in cache.slot_of and 1 in cache.slot_of
+        assert cache.pf_used >= 1
+        assert cache.pf_agree_tot == 2
+        # Demand ensure for the same ids should not re-fetch them as misses
+        # beyond what's already resident (hits).
+        cache.ensure(mx.array([[0, 1]]))
+        assert cache.misses == before  # no new misses for 0,1
+
+    def test_prefetch_on_off_bit_identical(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_OVERLAP", "0")
+        model, _ = _routed_checkpoint(tmp_path)
+        x = mx.random.normal((1, 1, D))
+        idx = _ri(1, 1, K)
+        # Reference without prefetch
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_PREFETCH", "0")
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        ref = model(x, idx)
+        mx.eval(ref)
+        # Rebuild with prefetch on
+        model2, _ = _routed_checkpoint(tmp_path)
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_PREFETCH", "1")
+        apply_moe_expert_offload(model2, tmp_path, 0.25)
+        got = model2(x, idx)
+        mx.eval(got)
+        assert bool(mx.array_equal(ref, got))
+
+    def test_overlap_still_bit_exact_with_prefetch(self, tmp_path, monkeypatch):
+        """#4037 within-layer overlap must remain bit-identical with prefetch on."""
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_PREFETCH", "1")
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_OVERLAP", "1")
+        model, _ = _routed_checkpoint(tmp_path)
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        sw = model.layers[0].mlp.switch_glu
+        x = mx.random.normal((1, 1, D))
+        idx = _ri(1, 1, K)
+        # Force slow-read path via monkeypatch grace? Just compare overlap on/off.
+        sw._overlap = False
+        a = sw(x, idx)
+        mx.eval(a)
+        # Reset residency by rebuilding
+        model2, _ = _routed_checkpoint(tmp_path)
+        apply_moe_expert_offload(model2, tmp_path, 0.25)
+        sw2 = model2.layers[0].mlp.switch_glu
+        sw2._overlap = True
+        b = sw2(x, idx)
+        mx.eval(b)
+        assert bool(mx.array_equal(a, b))
+
+    def test_runtime_kill_switch_stops_launch(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_PREFETCH", "1")
+        model, _ = _routed_checkpoint(tmp_path)
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        sw0 = model.layers[0].mlp.switch_glu
+        assert sw0._pf_next is not None
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_PREFETCH", "0")
+        assert not sw0._pf_active()
+        x = mx.random.normal((1, 1, D))
+        idx = _ri(1, 1, K)
+        sw0._overlap = False
+        before = model.layers[1].mlp.switch_glu.cache.pf_launched
+        sw0(x, idx)
+        mx.eval(mx.array(0))
+        after = model.layers[1].mlp.switch_glu.cache.pf_launched
+        assert after == before

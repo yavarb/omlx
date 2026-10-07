@@ -303,6 +303,48 @@ def _shutdown_io_pool() -> None:
 _SCORE_DECAY = 0.7
 _SCORE_DECAY_EVERY = 4
 
+
+# ---------------------------------------------------------------------------
+# Cross-layer L→L+1 expert prefetch (opt-in; default OFF).
+#
+# Ports streamlx F18 attention-window / routing-lookahead prefetch onto
+# ExpertCache / OffloadSwitchGLU. Naive "router(L+1) on residual(L)" was
+# measured 2-15% slower when mispredicts fought demand SSD reads
+# (docs/MoE_Expert_Offload.md). Guards:
+#   - OMLX_MOE_OFFLOAD_PREFETCH default 0 (kill switch)
+#   - OMLX_MOE_PF_TOPM (default 7) confidence cap
+#   - adaptive agreement gate (~0.55 after 512 samples)
+#   - demand-read priority: absorb before ensure; launch after this layer's
+#     demand path; dedicated 1-thread executor so submits do not starve the
+#     demand IO pool
+# ---------------------------------------------------------------------------
+_PF_AGREE_MIN = 0.55
+_PF_AGREE_WARMUP = 512
+_PF_EX: ThreadPoolExecutor | None = None
+_PF_EX_LOCK = threading.Lock()
+
+
+def _prefetch_enabled() -> bool:
+    """Kill switch: unset / anything other than "1" keeps prefetch off."""
+    return os.environ.get("OMLX_MOE_OFFLOAD_PREFETCH", "0") == "1"
+
+
+def _pf_topm() -> int:
+    try:
+        return max(0, int(os.environ.get("OMLX_MOE_PF_TOPM", "7")))
+    except ValueError:
+        return 7
+
+
+def _pf_ex() -> ThreadPoolExecutor:
+    """Dedicated single worker for prefetch submissions (demand pool stays free)."""
+    global _PF_EX
+    with _PF_EX_LOCK:
+        if _PF_EX is None:
+            _PF_EX = ThreadPoolExecutor(max_workers=1, thread_name_prefix="moe-pf")
+        return _PF_EX
+
+
 # Poll interval while the overlap path waits on reads (see _GpuKeepalive).
 _KEEPALIVE_PERIOD_S = 50e-6
 _KEEPALIVE_LOCAL = threading.local()
@@ -405,6 +447,13 @@ class ExpertCache:
         self._calls = 0
         self.hits = self.misses = 0
         self.fetched_bytes = 0
+        # Cross-layer prefetch state (see prefetch_start / prefetch_absorb).
+        self._pf = None  # (pred_set, launch, fut, rank_of) or None
+        self.pf_calls = 0
+        self.pf_launched = 0
+        self.pf_used = 0
+        self.pf_agree_hit = 0
+        self.pf_agree_tot = 0
         self._allocate(self.full_capacity)
         self.expert_bytes = sum(plan.nbytes for _, _, plan in self._plans(0))
 
@@ -603,6 +652,80 @@ class ExpertCache:
         # per-chunk eval in __call__, which is a different mechanism.
         return slow
 
+
+    def prefetch_start(self, pred: list[int]) -> None:
+        """Async raw read of predicted experts for this layer's *next* call.
+
+        ``pred`` is confidence-ordered (best first). Only missing experts with
+        rank < ``OMLX_MOE_PF_TOPM`` are launched — the rank tail is where
+        mispredictions concentrate. One prediction in flight; an unconsumed
+        one is dropped. Reads run on the dedicated prefetch executor so
+        submitting them cannot starve the demand IO pool.
+        """
+        rank_of = {e: r for r, e in enumerate(pred)}
+        missing = [e for e in pred if e not in self.slot_of]
+        topm = _pf_topm()
+        launch = [e for e in missing if rank_of[e] < topm]
+        if not launch:
+            self._pf = (set(pred), [], None, rank_of)
+            return
+        self.pf_launched += len(launch)
+        plans = {e: self._plans(e) for e in launch}
+
+        def _read(launch_ids=list(launch), plan_map=plans):
+            out = {}
+            for e in launch_ids:
+                out[e] = [
+                    (n, f, pl, CheckpointExpertStore.read(pl)) for n, f, pl in plan_map[e]
+                ]
+            return out
+
+        self._pf = (set(pred), list(launch), _pf_ex().submit(_read), rank_of)
+
+    def prefetch_absorb(self, wanted: list[int]) -> None:
+        """Install prefetched experts this step actually routed to.
+
+        Called *before* demand :meth:`ensure` / :meth:`_ensure_ids` so absorbed
+        experts are hits. Blocks on the in-flight read only when the step
+        needs those bytes (the same bytes demand would re-read). Wrong
+        predictions are not waited on, so they do not stall the demand path.
+        Tallies agreement for the adaptive per-layer gate.
+        """
+        pf, self._pf = self._pf, None
+        if pf is None:
+            return
+        pred_set, launch, fut, rank_of = pf
+        self.pf_calls += 1
+        wanted_set = set(int(e) for e in wanted)
+        self.pf_agree_hit += len(wanted_set & pred_set)
+        self.pf_agree_tot += len(wanted_set)
+        if fut is None:
+            return
+        take = [e for e in launch if e in wanted_set and e not in self.slot_of]
+        if not take:
+            return
+        try:
+            rows = fut.result()
+        except Exception:
+            return
+        protected = frozenset(wanted_set)
+        for e in take:
+            if e in self.slot_of:
+                continue
+            payload = rows.get(e)
+            if payload is None:
+                continue
+            try:
+                self._install(e, payload, protected)
+                self.pf_used += 1
+            except Exception:
+                continue
+
+    def prefetch_agreement(self) -> float:
+        if not self.pf_agree_tot:
+            return 1.0
+        return self.pf_agree_hit / self.pf_agree_tot
+
     def qmm(
         self, name: str, x: mx.array, slots: mx.array, sorted_indices: bool = False
     ) -> mx.array:
@@ -678,6 +801,10 @@ class OffloadSwitchGLU(nn.Module):
         # reads of missing experts are pending. OMLX_MOE_OFFLOAD_OVERLAP=0
         # keeps the serial order (read, then compute) for every step.
         self._overlap = os.environ.get("OMLX_MOE_OFFLOAD_OVERLAP", "1") != "0"
+        # Cross-layer L→L+1 prefetch link: (next_cache, gate, w_this, w_next).
+        # Wired by apply_moe_expert_offload only when OMLX_MOE_OFFLOAD_PREFETCH=1.
+        self._pf_next = None
+        self._pf_ratio = None
 
     def _glu(self, x: mx.array, slots: mx.array) -> mx.array:
         c = self.cache
@@ -695,6 +822,68 @@ class OffloadSwitchGLU(nn.Module):
         rows = mx.take(flat_x, mx.array([p // k for p in pos], dtype=mx.int32), axis=0)
         slots = mx.array([self.cache.slot_of[flat[p]] for p in pos], dtype=mx.int32)
         return self._glu(mx.expand_dims(rows, (-2, -3)), slots.reshape(-1, 1))
+
+
+    def _pf_active(self) -> bool:
+        """Runtime kill switch + linked neighbor required."""
+        return _prefetch_enabled() and self._pf_next is not None
+
+    def _pf_pred_lazy(self, x: mx.array, k: int):
+        """Predict next MoE layer's top-k from this layer's residual (F18).
+
+        ``x`` is the SwitchGLU input (= post_attn_ln_this(h)). The next gate
+        wants post_attn_ln_next(h). Both RMSNorms share rms(h), so rescaling
+        by ``w_next / w_this`` reproduces the next gate input. Returns
+        ``(indices, scores)`` arrays that the caller evaluates inside the
+        sync it already pays — or ``None`` when gated off / unlinkable.
+        """
+        nxt = self._pf_next
+        if nxt is None:
+            return None
+        next_cache, gate, w_i, w_j = nxt
+        if (
+            next_cache.pf_agree_tot >= _PF_AGREE_WARMUP
+            and next_cache.prefetch_agreement() < _PF_AGREE_MIN
+        ):
+            return None
+        try:
+            if w_i is not None and w_j is not None:
+                if self._pf_ratio is None:
+                    self._pf_ratio = (w_j / w_i).astype(x.dtype)
+                logits = gate(x * self._pf_ratio)
+            else:
+                logits = gate(x)
+            if isinstance(logits, tuple):
+                return logits[0], logits[1]
+            # scores descending via take_along_axis after argpartition
+            inds = mx.argpartition(-logits, kth=k - 1, axis=-1)[..., :k]
+            scores = mx.take_along_axis(logits, inds, axis=-1)
+            return inds, scores
+        except Exception:
+            self._pf_next = None
+            return None
+
+    def _pf_absorb(self, ids) -> None:
+        if self._pf_active():
+            self.cache.prefetch_absorb(list(ids))
+
+    def _pf_launch_after(self, x: mx.array, indices: mx.array) -> None:
+        """After this layer's demand path, start L+1 reads (decode only)."""
+        if not self._pf_active():
+            return
+        # One token (decode): batch*time == 1. Prefill must not launch —
+        # working sets are huge and would fight demand reads.
+        k = int(indices.shape[-1])
+        if indices.size // k != 1:
+            return
+        pred = self._pf_pred_lazy(x, k)
+        if pred is None:
+            return
+        mx.eval(*pred)
+        pi = np.asarray(pred[0]).reshape(-1)
+        ps = np.asarray(pred[1]).reshape(-1)
+        ordered = list(dict.fromkeys(int(pi[j]) for j in np.argsort(-ps)))
+        self._pf_next[0].prefetch_start(ordered)
 
     def _forward_overlap(self, x: mx.array, indices: mx.array) -> mx.array:
         """Decode step that keeps the GPU busy while slow reads are pending.
@@ -719,6 +908,7 @@ class OffloadSwitchGLU(nn.Module):
         """
         c = self.cache
         flat = indices.reshape(-1).tolist()  # the sync
+        self._pf_absorb(flat)  # adopt L→L prefetch before demand ensure
         hit = [e in c.slot_of for e in flat]  # residency before any install
         hit_pos = [p for p, h in enumerate(hit) if h]
         flat_x = x.reshape(-1, x.shape[-1])
@@ -746,6 +936,7 @@ class OffloadSwitchGLU(nn.Module):
             out = out.reshape(indices.shape + (y.shape[-1],))
         if slow:
             mx.async_eval(out)
+        self._pf_launch_after(x, indices)
         return out
 
     def _forward(self, x: mx.array, indices: mx.array) -> mx.array:
@@ -757,22 +948,26 @@ class OffloadSwitchGLU(nn.Module):
             and _io_pool() is not None
         ):
             return self._forward_overlap(x, indices)
+        # Serial path: absorb any cross-layer prefetch before demand ensure.
+        self._pf_absorb(indices.reshape(-1).tolist())
         c.ensure(indices)
         slots = mx.take(c.map, indices)
-        x = mx.expand_dims(x, (-2, -3))
+        x_exp = mx.expand_dims(x, (-2, -3))
         # Mirror the stock SwitchGLU's sort rule exactly (threshold and all):
         # decode calls are far below it, and forcing the sort there measured
         # slower than it saved.
         do_sort = indices.size >= _SORT_MIN_ROUTES
         inv = None
         if do_sort:
-            x, slots, inv = _gather_sort(x, slots)
-        up = c.qmm("up_proj", x, slots, do_sort)
-        gate = c.qmm("gate_proj", x, slots, do_sort)
+            x_exp, slots, inv = _gather_sort(x_exp, slots)
+        up = c.qmm("up_proj", x_exp, slots, do_sort)
+        gate = c.qmm("gate_proj", x_exp, slots, do_sort)
         out = c.qmm("down_proj", self.activation(up, gate), slots, do_sort)
         if do_sort:
             out = _scatter_unsort(out, inv, indices.shape)
-        return out.squeeze(-2)
+        out = out.squeeze(-2)
+        self._pf_launch_after(x, indices)
+        return out
 
     def _forward_expert_major(
         self, flat_x: mx.array, ids: list[int], k: int, do_sort: bool
@@ -1044,6 +1239,107 @@ def _resolve_store_view(
     return view, None
 
 
+
+def _layer_index_from_path(path: str) -> int | None:
+    """Return N for a module path containing ``layers.N``; else None."""
+    m = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", path)
+    return int(m.group(1)) if m else None
+
+
+def _find_moe_gate(layer) -> object | None:
+    """Best-effort MoE router on a transformer layer (mlx-lm / mlx-vlm layouts)."""
+    for attr in ("mlp", "block_sparse_moe", "moe", "experts"):
+        block = getattr(layer, attr, None)
+        if block is None:
+            continue
+        gate = getattr(block, "gate", None)
+        if gate is not None and callable(gate):
+            return gate
+    return None
+
+
+def _layer_module_for_path(model, path: str):
+    """Resolve the ``layers.N`` module object from a dotted SwitchGLU path."""
+    idx = _layer_index_from_path(path)
+    if idx is None:
+        return None
+    # Walk to the list/module that owns layers, then index.
+    # Common: layers.N.... or language_model.model.layers.N....
+    parts = path.split(".")
+    try:
+        li = parts.index("layers")
+    except ValueError:
+        return None
+    obj = model
+    for p in parts[:li]:
+        if isinstance(obj, dict):
+            obj = obj[p]
+        else:
+            obj = getattr(obj, p)
+    layers = obj["layers"] if isinstance(obj, dict) else getattr(obj, "layers")
+    return layers[idx]
+
+
+def _link_cross_layer_prefetch(model) -> int:
+    """Wire adjacent wrapped MoE layers for attention-window prefetch.
+
+    Only runs when ``OMLX_MOE_OFFLOAD_PREFETCH=1``. Skips pairs that are not
+    consecutive layer indices (an intervening block stales the residual) or
+    that lack a router / post-attention RMSNorm weights for the gate-ratio
+    trick. Returns the number of links created.
+    """
+    if not _prefetch_enabled():
+        return 0
+    found: list[tuple[int, object, object, str]] = []
+    # _iter_switch_glus only yields stock SwitchGLU; after wrap, walk OffloadSwitchGLU.
+    seen = set()
+
+    def walk(obj, path):
+        if id(obj) in seen:
+            return
+        seen.add(id(obj))
+        if type(obj).__name__ == "OffloadSwitchGLU" and hasattr(obj, "cache"):
+            idx = _layer_index_from_path(path)
+            if idx is not None:
+                layer = _layer_module_for_path(model, path)
+                if layer is not None:
+                    found.append((idx, layer, obj, path))
+            return
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                walk(v, f"{path}.{k}" if path else k)
+        elif isinstance(obj, (list, tuple)):
+            for i, v in enumerate(obj):
+                walk(v, f"{path}.{i}")
+
+    walk(model, "")
+    found.sort(key=lambda t: t[0])
+    linked = 0
+    for (i, layer_i, switch_i, _), (j, layer_j, switch_j, _) in zip(
+        found, found[1:]
+    ):
+        if j != i + 1:
+            continue
+        gate = _find_moe_gate(layer_j)
+        ln_i = getattr(layer_i, "post_attention_layernorm", None)
+        ln_j = getattr(layer_j, "post_attention_layernorm", None)
+        if gate is None or ln_i is None or ln_j is None:
+            continue
+        w_i = getattr(ln_i, "weight", None)
+        w_j = getattr(ln_j, "weight", None)
+        if w_i is None or w_j is None:
+            continue
+        switch_i._pf_next = (switch_j.cache, gate, w_i, w_j)
+        switch_i._pf_ratio = None
+        linked += 1
+    if linked:
+        logger.info(
+            "moe expert offload: cross-layer prefetch linked %d adjacent layer pairs",
+            linked,
+        )
+    return linked
+
+
 def apply_moe_expert_offload(
     model,
     model_path: str | Path,
@@ -1142,6 +1438,7 @@ def apply_moe_expert_offload(
             total_bytes / 1e9,
             resident_bytes / 1e9,
         )
+    _link_cross_layer_prefetch(model)
     return wrapped
 
 
