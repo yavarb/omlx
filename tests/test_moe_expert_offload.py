@@ -1550,6 +1550,22 @@ class TestCrossLayerPrefetch:
         assert pred[0].shape[-1] == K
         assert bool(mx.all(mx.isfinite(sw0._pf_ratio)))
 
+    def test_bf16_decode_launches_prefetch(self, tmp_path, monkeypatch):
+        """Router logits are bf16 in serving; numpy cannot read bf16 buffers."""
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_PREFETCH", "1")
+        monkeypatch.setenv("OMLX_MOE_OFFLOAD_OVERLAP", "0")
+        model, _ = _hyper_checkpoint(tmp_path)
+        apply_moe_expert_offload(model, tmp_path, 0.25)
+        model.layers[1].mlp.gate.set_dtype(mx.bfloat16)
+        sw0 = model.layers[0].mlp.switch_glu
+        x = mx.random.normal((1, 1, D)).astype(mx.bfloat16)
+        sw0._pf_launch_after(x, _ri(1, 1, K))
+        assert sw0._pf_next is not None  # not unlinked by a failure
+        nxt = model.layers[1].mlp.switch_glu.cache
+        assert nxt._pf is not None
+        if nxt._pf[2] is not None:
+            nxt._pf[2].result()
+
     def test_hyper_connection_on_off_bit_identical(self, tmp_path, monkeypatch):
         monkeypatch.setenv("OMLX_MOE_OFFLOAD_OVERLAP", "0")
         x = mx.random.normal((1, 1, D))

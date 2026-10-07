@@ -883,11 +883,22 @@ class OffloadSwitchGLU(nn.Module):
         pred = self._pf_pred_lazy(x, k)
         if pred is None:
             return
-        mx.eval(*pred)
-        pi = np.asarray(pred[0]).reshape(-1)
-        ps = np.asarray(pred[1]).reshape(-1)
-        ordered = list(dict.fromkeys(int(pi[j]) for j in np.argsort(-ps)))
-        self._pf_next[0].prefetch_start(ordered)
+        try:
+            # numpy cannot read bfloat16 buffers; router logits are bf16.
+            inds = pred[0].astype(mx.int32)
+            scores = pred[1].astype(mx.float32)
+            mx.eval(inds, scores)
+            pi = np.asarray(inds).reshape(-1)
+            ps = np.asarray(scores).reshape(-1)
+            ordered = list(dict.fromkeys(int(pi[j]) for j in np.argsort(-ps)))
+            self._pf_next[0].prefetch_start(ordered)
+        except Exception:
+            # A prediction failure must never fail the decode step.
+            logger.warning(
+                "moe expert offload: cross-layer prefetch failed; unlinking",
+                exc_info=True,
+            )
+            self._pf_next = None
 
     def _forward_overlap(self, x: mx.array, indices: mx.array) -> mx.array:
         """Decode step that keeps the GPU busy while slow reads are pending.
